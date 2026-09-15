@@ -1,0 +1,142 @@
+# REC-007 — Watchdog externo de n8n
+# Vive FUERA de n8n a propósito: si n8n muere, nadie dentro de n8n puede levantarlo.
+# Cada 5 min: health check → si cae 3 veces seguidas → cooldown → reinicio vía EasyPanel → reverificar → avisar.
+# Avisa SOLO cuando actúa (o cuando actuaría, en modo sombra). Un check exitoso solo deja log aquí.
+name: Watchdog n8n externo (REC-007)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      forzar_estado:
+        description: "Prueba: 'caido' simula que n8n no responde (no toca n8n). Vacío = check normal."
+        required: false
+        default: ""
+
+# Idempotencia: nunca dos corridas a la vez; la segunda espera a que termine la primera.
+concurrency:
+  group: watchdog-n8n
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  vigilar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      N8N_HEALTH_URL: ${{ secrets.N8N_HEALTH_URL }}
+      EASYPANEL_URL: ${{ secrets.EASYPANEL_URL }}
+      EASYPANEL_TOKEN: ${{ secrets.EASYPANEL_TOKEN }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      EASYPANEL_PROJECT: ${{ secrets.EASYPANEL_PROJECT }}
+      EASYPANEL_SERVICE: ${{ secrets.EASYPANEL_SERVICE }}
+      MODO_SOMBRA: ${{ vars.MODO_SOMBRA }}
+      COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
+      FORZAR_ESTADO: ${{ github.event.inputs.forzar_estado }}
+      RECETA_ID: REC-007
+    steps:
+      - name: Validar configuración
+        run: |
+          faltan=""
+          for v in N8N_HEALTH_URL EASYPANEL_URL EASYPANEL_TOKEN SUPABASE_URL SUPABASE_SERVICE_KEY TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID EASYPANEL_PROJECT EASYPANEL_SERVICE MODO_SOMBRA COOLDOWN_MIN; do
+            if [ -z "${!v}" ]; then faltan="$faltan $v"; fi
+          done
+          if [ -n "$faltan" ]; then echo "::error::Faltan secrets/variables:$faltan"; exit 1; fi
+          echo "Config OK | modo_sombra=$MODO_SOMBRA | cooldown=${COOLDOWN_MIN} min"
+
+      - name: Health check de n8n (3 intentos, 20 s entre cada uno)
+        id: salud
+        run: |
+          if [ "$FORZAR_ESTADO" = "caido" ]; then
+            echo "PRUEBA: estado forzado a 'caido' (n8n NO fue tocado)"
+            echo "estado=caido" >> "$GITHUB_OUTPUT"; echo "codigo=SIMULADO" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          codigo=000
+          for i in 1 2 3; do
+            codigo=$(curl -sS -o /tmp/salud.json -w '%{http_code}' --max-time 15 "$N8N_HEALTH_URL" 2>/dev/null || echo 000)
+            cuerpo=$(head -c 200 /tmp/salud.json 2>/dev/null || true)
+            if [ "$codigo" = "200" ] && echo "$cuerpo" | grep -q '"status":"ok"'; then
+              echo "OK: n8n responde 200 status=ok (intento $i). Sin acción."
+              echo "estado=ok" >> "$GITHUB_OUTPUT"; echo "codigo=$codigo" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            echo "AVISO: intento $i/3 -> HTTP $codigo cuerpo='$cuerpo'"
+            if [ "$i" -lt 3 ]; then sleep 20; fi
+          done
+          echo "CAIDO: n8n no responde tras 3 intentos (último HTTP $codigo)"
+          echo "estado=caido" >> "$GITHUB_OUTPUT"; echo "codigo=$codigo" >> "$GITHUB_OUTPUT"
+
+      - name: Cooldown (¿ya se actuó en los últimos minutos?)
+        id: cooldown
+        if: steps.salud.outputs.estado == 'caido'
+        run: |
+          desde=$(date -u -d "-${COOLDOWN_MIN} minutes" +%Y-%m-%dT%H:%M:%SZ)
+          n=$(curl -sS --max-time 15 -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            "$SUPABASE_URL/rest/v1/vigilante_autofix_log?receta_id=eq.$RECETA_ID&iniciado_en=gte.$desde&select=id" | jq 'length' 2>/dev/null || echo "error")
+          if [ "$n" = "error" ]; then
+            echo "AVISO: no se pudo consultar el cooldown en Supabase. Por seguridad se actúa igual (n8n caído pesa más)."
+            echo "actuar=si" >> "$GITHUB_OUTPUT"
+          elif [ "$n" -gt 0 ]; then
+            echo "PAUSA: ya hubo $n acción(es) de $RECETA_ID en los últimos $COOLDOWN_MIN min. No se repite (idempotencia)."
+            echo "actuar=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "Sin acciones recientes. Se procede."
+            echo "actuar=si" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reiniciar n8n vía EasyPanel (o solo simular, en modo sombra)
+        id: accion
+        if: steps.salud.outputs.estado == 'caido' && steps.cooldown.outputs.actuar == 'si'
+        run: |
+          inicio=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "inicio=$inicio" >> "$GITHUB_OUTPUT"
+          if [ "$MODO_SOMBRA" = "true" ]; then
+            echo "MODO SOMBRA: aquí se habría reiniciado el servicio de n8n vía EasyPanel. No se ejecuta nada."
+            echo "modo=sombra" >> "$GITHUB_OUTPUT"; echo "resultado=sombra" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "modo=real" >> "$GITHUB_OUTPUT"
+          cuerpo=$(jq -n --arg p "$EASYPANEL_PROJECT" --arg s "$EASYPANEL_SERVICE" '{json:{projectName:$p, serviceName:$s}}')
+          http=$(curl -sS -o /tmp/restart.json -w '%{http_code}' --max-time 60 -X POST \
+            -H "Authorization: Bearer $EASYPANEL_TOKEN" -H "Content-Type: application/json" \
+            "$EASYPANEL_URL/api/trpc/services.app.restartService" -d "$cuerpo" || echo 000)
+          echo "EasyPanel respondió HTTP $http: $(head -c 300 /tmp/restart.json)"
+          if [ "$http" != "200" ]; then echo "resultado=restart_fallido" >> "$GITHUB_OUTPUT"; exit 0; fi
+          for i in $(seq 1 15); do
+            sleep 10
+            codigo=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$N8N_HEALTH_URL" 2>/dev/null || echo 000)
+            echo "reverificación $i/15: HTTP $codigo"
+            if [ "$codigo" = "200" ]; then echo "resultado=resuelto" >> "$GITHUB_OUTPUT"; echo "segundos=$((i*10))" >> "$GITHUB_OUTPUT"; exit 0; fi
+          done
+          echo "resultado=sigue_caido" >> "$GITHUB_OUTPUT"
+
+      - name: Registrar en vigilante_autofix_log y avisar por Telegram
+        if: steps.salud.outputs.estado == 'caido' && steps.cooldown.outputs.actuar == 'si'
+        env:
+          MODO: ${{ steps.accion.outputs.modo }}
+          RES: ${{ steps.accion.outputs.resultado }}
+          INICIO: ${{ steps.accion.outputs.inicio }}
+          SEGUNDOS: ${{ steps.accion.outputs.segundos }}
+          CODIGO: ${{ steps.salud.outputs.codigo }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$RES" in
+            sombra)          estado="sombra";   txt="🌓 <b>[Watchdog n8n externo]</b> MODO SOMBRA: n8n no respondió 3 veces seguidas (HTTP $CODIGO). En modo real aquí lo habría reiniciado vía EasyPanel. No se hizo nada." ;;
+            resuelto)        estado="resuelto"; txt="✅ <b>[Watchdog n8n externo]</b> n8n no respondía (HTTP $CODIGO). Lo reinicié vía EasyPanel y volvió a responder en $SEGUNDOS s." ;;
+            sigue_caido)     estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no respondía. Lo reinicié vía EasyPanel pero SIGUE sin responder después de 150 s. Revisar a mano (EasyPanel → servicio de n8n → logs)." ;;
+            restart_fallido) estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y EasyPanel NO aceptó la orden de reinicio. Revisar a mano." ;;
+            *)               estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y el reinicio terminó en estado desconocido ('$RES'). Revisar a mano." ;;
+          esac
+          body=$(jq -n --arg r "$RECETA_ID" --arg m "$MODO" --arg e "$estado" --arg ini "$INICIO" --arg url "$RUN_URL" --arg cod "$CODIGO" \
+            '{receta_id:$r, intento:1, modo:$m, estado:$e, iniciado_en:$ini, finalizado_en:(now|todate), resultado:{origen:"github_actions", run:$url, http_salud:$cod}, verificacion:{resultado:$e}}')
+          http=$(curl -sS -o /tmp/log.json -w '%{http_code}' --max-time 15 -X POST \
+            -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+            "$SUPABASE_URL/rest/v1/vigilante_autofix_log" -d "$body" || echo 000)
+          echo "Supabase autofix_log: HTTP $http $(head -c 200 /tmp/log.json)"
+          txt="$txt"$'\n'"Corrida: $RUN_URL"
+          http=$(curl -sS -o /tmp/tg.json -w '%{http_code}' --max-time 15 -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "parse_mode=HTML" --data-urlencode "text=$txt" || echo 000)
+          echo "Telegram: HTTP $http"

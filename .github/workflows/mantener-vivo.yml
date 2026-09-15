@@ -1,0 +1,26 @@
+# GitHub desactiva solo los crons de un repo sin actividad durante 60 días.
+# Este workflow hace un commit mínimo el día 1 de cada mes para que el watchdog nunca se apague solo.
+name: Mantener vivo el cron (commit mensual)
+
+on:
+  schedule:
+    - cron: "17 12 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  latido:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit de latido
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .latido
+          git config user.name "watchdog-bot"
+          git config user.email "watchdog-bot@users.noreply.github.com"
+          git add .latido
+          git commit -m "latido: $(cat .latido)" || echo "sin cambios"
+          git push
