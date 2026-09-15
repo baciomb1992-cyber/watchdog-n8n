@@ -2,6 +2,7 @@
 # Vive FUERA de n8n a propósito: si n8n muere, nadie dentro de n8n puede levantarlo.
 # Cada 5 min: health check → si cae 3 veces seguidas → cooldown → reinicio vía EasyPanel → reverificar → avisar.
 # Avisa SOLO cuando actúa (o cuando actuaría, en modo sombra). Un check exitoso solo deja log aquí.
+# Registrado el 2026-09-14 (primer push del cron).
 name: Watchdog n8n externo (REC-007)
 
 on:
