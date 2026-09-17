@@ -1,8 +1,25 @@
 # REC-007 — Watchdog externo de n8n
 # Vive FUERA de n8n a propósito: si n8n muere, nadie dentro de n8n puede levantarlo.
-# Cada 5 min: health check → si cae 3 veces seguidas → cooldown → reinicio vía EasyPanel → reverificar → avisar.
+# Cada 5 min: health check → si cae 5 veces seguidas (~2.5 min) → cooldown → última
+# reconfirmación → reinicio vía EasyPanel → reverificar → avisar.
 # Avisa SOLO cuando actúa (o cuando actuaría, en modo sombra). Un check exitoso solo deja log aquí.
 # Registrado el 2026-09-14 (primer push del cron).
+#
+# 2026-09-17: incidente real (corrida 35238035232, 09:06-09:09 AM Monterrey) --
+# n8n, EasyPanel Y Supabase (los 3 en el mismo VPS) dieron HTTP 000 (curl no pudo
+# ni conectar, no fue un rechazo) durante ~2-3 min mientras WF01 (el cron interno
+# de n8n) seguia corriendo sin huecos -- fue un blip de red hacia el VPS, no n8n
+# caido de verdad. El aviso decia "EasyPanel NO aceptó la orden" cuando en
+# realidad nunca se pudo ni conectar. Cambios de esta version:
+#   1. Health check paso de 3 a 5 intentos (~70s -> ~150s de ventana) para
+#      no reaccionar a un blip corto.
+#   2. Reconfirmacion final justo antes de reiniciar -- si ya se recupero solo
+#      mientras corria el cooldown, no se toca nada.
+#   3. El reinicio en EasyPanel reintenta 1 vez mas antes de darse por vencido.
+#   4. El mensaje y el log ya distinguen "no pude ni conectar" (HTTP 000) de un
+#      rechazo real de EasyPanel (HTTP 4xx/5xx) -- son causas y fixes distintos.
+#   5. El registro en vigilante_autofix_log reintenta 3 veces (ese POST tambien
+#      fallo con 000 en el incidente real, y el intento se quedo sin rastro).
 name: Watchdog n8n externo (REC-007)
 
 on:
@@ -50,7 +67,7 @@ jobs:
           if [ -n "$faltan" ]; then echo "::error::Faltan secrets/variables:$faltan"; exit 1; fi
           echo "Config OK | modo_sombra=$MODO_SOMBRA | cooldown=${COOLDOWN_MIN} min"
 
-      - name: Health check de n8n (3 intentos, 20 s entre cada uno)
+      - name: Health check de n8n (5 intentos, 20 s entre cada uno, ~2.5 min)
         id: salud
         run: |
           if [ "$FORZAR_ESTADO" = "caido" ]; then
@@ -58,17 +75,17 @@ jobs:
             echo "estado=caido" >> "$GITHUB_OUTPUT"; echo "codigo=SIMULADO" >> "$GITHUB_OUTPUT"; exit 0
           fi
           codigo=000
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             codigo=$(curl -sS -o /tmp/salud.json -w '%{http_code}' --max-time 15 "$N8N_HEALTH_URL" 2>/dev/null || echo 000)
             cuerpo=$(head -c 200 /tmp/salud.json 2>/dev/null || true)
             if [ "$codigo" = "200" ] && echo "$cuerpo" | grep -q '"status":"ok"'; then
               echo "OK: el servicio responde 200 status=ok (intento $i). Sin acción."
               echo "estado=ok" >> "$GITHUB_OUTPUT"; echo "codigo=$codigo" >> "$GITHUB_OUTPUT"; exit 0
             fi
-            echo "AVISO: intento $i/3 -> HTTP $codigo cuerpo='$cuerpo'"
-            if [ "$i" -lt 3 ]; then sleep 20; fi
+            echo "AVISO: intento $i/5 -> HTTP $codigo cuerpo='$cuerpo'"
+            if [ "$i" -lt 5 ]; then sleep 20; fi
           done
-          echo "CAIDO: el servicio no responde tras 3 intentos (último HTTP $codigo)"
+          echo "CAIDO: el servicio no responde tras 5 intentos en ~2.5 min (último HTTP $codigo)"
           echo "estado=caido" >> "$GITHUB_OUTPUT"; echo "codigo=$codigo" >> "$GITHUB_OUTPUT"
 
       - name: Cooldown (¿ya se actuó en los últimos minutos?)
@@ -95,17 +112,40 @@ jobs:
         run: |
           inicio=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           echo "inicio=$inicio" >> "$GITHUB_OUTPUT"
+
+          # Última oportunidad: el blip pudo resolverse solo mientras corría el
+          # cooldown (2026-09-17: la caída real duró ~2-3 min, tiempo de sobra
+          # para colarse en esta ventana). Reinicia solo si SIGUE caído.
+          codigo_final=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$N8N_HEALTH_URL" 2>/dev/null || echo 000)
+          if [ "$codigo_final" = "200" ]; then
+            echo "RECUPERADO SOLO justo antes de actuar (HTTP $codigo_final). No se reinicia nada."
+            echo "modo=ninguno" >> "$GITHUB_OUTPUT"; echo "resultado=recuperado_solo" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
           if [ "$MODO_SOMBRA" = "true" ]; then
             echo "MODO SOMBRA: aquí se habría reiniciado el servicio vía EasyPanel. No se ejecuta nada."
             echo "modo=sombra" >> "$GITHUB_OUTPUT"; echo "resultado=sombra" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "modo=real" >> "$GITHUB_OUTPUT"
           cuerpo=$(jq -n --arg p "$EASYPANEL_PROJECT" --arg s "$EASYPANEL_SERVICE" '{json:{projectName:$p, serviceName:$s}}')
-          http=$(curl -sS -o /tmp/restart.json -w '%{http_code}' --max-time 60 -X POST \
-            -H "Authorization: Bearer $EASYPANEL_TOKEN" -H "Content-Type: application/json" \
-            "$EASYPANEL_URL/api/trpc/services.app.restartService" -d "$cuerpo" || echo 000)
-          echo "EasyPanel respondió HTTP $http: $(head -c 300 /tmp/restart.json)"
-          if [ "$http" != "200" ]; then echo "resultado=restart_fallido" >> "$GITHUB_OUTPUT"; exit 0; fi
+          http=000
+          for intento in 1 2; do
+            http=$(curl -sS -o /tmp/restart.json -w '%{http_code}' --max-time 60 -X POST \
+              -H "Authorization: Bearer $EASYPANEL_TOKEN" -H "Content-Type: application/json" \
+              "$EASYPANEL_URL/api/trpc/services.app.restartService" -d "$cuerpo" || echo 000)
+            echo "EasyPanel respondió HTTP $http (intento $intento/2): $(head -c 300 /tmp/restart.json)"
+            if [ "$http" = "200" ]; then break; fi
+            [ "$intento" -eq 1 ] && sleep 10
+          done
+          echo "http_restart=$http" >> "$GITHUB_OUTPUT"
+          if [ "$http" != "200" ]; then
+            if [ "$http" = "000" ]; then
+              echo "resultado=restart_sin_conexion" >> "$GITHUB_OUTPUT"
+            else
+              echo "resultado=restart_rechazado" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
           for i in $(seq 1 15); do
             sleep 10
             codigo=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$N8N_HEALTH_URL" 2>/dev/null || echo 000)
@@ -122,21 +162,29 @@ jobs:
           INICIO: ${{ steps.accion.outputs.inicio }}
           SEGUNDOS: ${{ steps.accion.outputs.segundos }}
           CODIGO: ${{ steps.salud.outputs.codigo }}
+          HTTP_RESTART: ${{ steps.accion.outputs.http_restart }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           case "$RES" in
-            sombra)          estado="sombra";   txt="🌓 <b>[Watchdog n8n externo]</b> MODO SOMBRA: n8n no respondió 3 veces seguidas (HTTP $CODIGO). En modo real aquí lo habría reiniciado vía EasyPanel. No se hizo nada." ;;
-            resuelto)        estado="resuelto"; txt="✅ <b>[Watchdog n8n externo]</b> n8n no respondía (HTTP $CODIGO). Lo reinicié vía EasyPanel y volvió a responder en $SEGUNDOS s." ;;
-            sigue_caido)     estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no respondía. Lo reinicié vía EasyPanel pero SIGUE sin responder después de 150 s. Revisar a mano (EasyPanel → servicio de n8n → logs)." ;;
-            restart_fallido) estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y EasyPanel NO aceptó la orden de reinicio. Revisar a mano." ;;
-            *)               estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y el reinicio terminó en estado desconocido ('$RES'). Revisar a mano." ;;
+            recuperado_solo)      estado="resuelto"; txt="🟡 <b>[Watchdog n8n externo]</b> n8n no respondió varias veces seguidas (HTTP $CODIGO), pero volvió a responder solo justo antes de que se intentara reiniciar. No se tocó nada." ;;
+            sombra)                estado="sombra";   txt="🌓 <b>[Watchdog n8n externo]</b> MODO SOMBRA: n8n no respondió 5 veces seguidas en ~2.5 min (HTTP $CODIGO). En modo real aquí lo habría reiniciado vía EasyPanel. No se hizo nada." ;;
+            resuelto)               estado="resuelto"; txt="✅ <b>[Watchdog n8n externo]</b> n8n no respondía (HTTP $CODIGO). Lo reinicié vía EasyPanel y volvió a responder en $SEGUNDOS s." ;;
+            sigue_caido)            estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no respondía. Lo reinicié vía EasyPanel pero SIGUE sin responder después de 150 s. Revisar a mano (EasyPanel → servicio de n8n → logs)." ;;
+            restart_sin_conexion)   estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y NO pude ni conectarme a EasyPanel para pedir el reinicio (timeout, no un rechazo). Probable problema de red hacia el VPS, no necesariamente n8n caído por dentro. Revisar a mano." ;;
+            restart_rechazado)      estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y EasyPanel RECHAZÓ la orden de reinicio (HTTP $HTTP_RESTART). Revisar token/credenciales de EasyPanel. Revisar a mano." ;;
+            *)                      estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y el reinicio terminó en estado desconocido ('$RES'). Revisar a mano." ;;
           esac
-          body=$(jq -n --arg r "$RECETA_ID" --arg m "$MODO" --arg e "$estado" --arg ini "$INICIO" --arg url "$RUN_URL" --arg cod "$CODIGO" \
-            '{receta_id:$r, intento:1, modo:$m, estado:$e, iniciado_en:$ini, finalizado_en:(now|todate), resultado:{origen:"github_actions", run:$url, http_salud:$cod}, verificacion:{resultado:$e}}')
-          http=$(curl -sS -o /tmp/log.json -w '%{http_code}' --max-time 15 -X POST \
-            -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" -H "Content-Type: application/json" -H "Prefer: return=minimal" \
-            "$SUPABASE_URL/rest/v1/vigilante_autofix_log" -d "$body" || echo 000)
-          echo "Supabase autofix_log: HTTP $http $(head -c 200 /tmp/log.json)"
+          body=$(jq -n --arg r "$RECETA_ID" --arg m "$MODO" --arg e "$estado" --arg ini "$INICIO" --arg url "$RUN_URL" --arg cod "$CODIGO" --arg hr "$HTTP_RESTART" \
+            '{receta_id:$r, intento:1, modo:$m, estado:$e, iniciado_en:$ini, finalizado_en:(now|todate), resultado:{origen:"github_actions", run:$url, http_salud:$cod, http_restart:$hr}, verificacion:{resultado:$e}}')
+          http=000
+          for intento in 1 2 3; do
+            http=$(curl -sS -o /tmp/log.json -w '%{http_code}' --max-time 15 -X POST \
+              -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+              "$SUPABASE_URL/rest/v1/vigilante_autofix_log" -d "$body" || echo 000)
+            echo "Supabase autofix_log intento $intento/3: HTTP $http $(head -c 200 /tmp/log.json)"
+            case "$http" in 2??) break ;; esac
+            [ "$intento" -lt 3 ] && sleep 5
+          done
           txt="$txt"$'\n'"Corrida: $RUN_URL"
           http=$(curl -sS -o /tmp/tg.json -w '%{http_code}' --max-time 15 -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
             --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "parse_mode=HTML" --data-urlencode "text=$txt" || echo 000)
