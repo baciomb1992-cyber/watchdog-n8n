@@ -20,6 +20,21 @@
 #      rechazo real de EasyPanel (HTTP 4xx/5xx) -- son causas y fixes distintos.
 #   5. El registro en vigilante_autofix_log reintenta 3 veces (ese POST tambien
 #      fallo con 000 en el incidente real, y el intento se quedo sin rastro).
+#
+# 2026-09-18 (madrugada, corrida 35308023086): mismo blip de red, pero el aviso
+# volvió a decir "EasyPanel RECHAZÓ la orden (revisar token/credenciales)" cuando
+# en realidad el curl del reinicio dio timeout (exit 28), no un rechazo. Causa:
+# cuando curl no logra conectar, `-w '%{http_code}'` YA imprime "000" por su
+# cuenta, y el `|| echo 000` de respaldo se dispara ADEMÁS (porque curl también
+# sale con código de error) -- las dos salidas se concatenan y el código queda
+# "000000" en vez de "000". La comparación exacta `[ "$http" = "000" ]` nunca
+# hace match con "000000", así que cae en la rama de "rechazado" (mensaje de
+# revisar credenciales) en vez de "sin_conexion" (mensaje de problema de red).
+# Fix: normalizar cada código a sus últimos 3 caracteres (`${var: -3}`) justo
+# después de capturarlo con curl, en los 5 puntos del workflow que usan este
+# patrón (health check, reconfirmación, reinicio, reverificación, log a
+# Supabase) -- no solo donde rompía la lógica, también donde solo ensuciaba
+# el log con "HTTP 000000".
 name: Watchdog n8n externo (REC-007)
 
 on:
@@ -77,6 +92,7 @@ jobs:
           codigo=000
           for i in 1 2 3 4 5; do
             codigo=$(curl -sS -o /tmp/salud.json -w '%{http_code}' --max-time 15 "$N8N_HEALTH_URL" 2>/dev/null || echo 000)
+            codigo="${codigo: -3}"
             cuerpo=$(head -c 200 /tmp/salud.json 2>/dev/null || true)
             if [ "$codigo" = "200" ] && echo "$cuerpo" | grep -q '"status":"ok"'; then
               echo "OK: el servicio responde 200 status=ok (intento $i). Sin acción."
@@ -117,6 +133,7 @@ jobs:
           # cooldown (2026-09-17: la caída real duró ~2-3 min, tiempo de sobra
           # para colarse en esta ventana). Reinicia solo si SIGUE caído.
           codigo_final=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$N8N_HEALTH_URL" 2>/dev/null || echo 000)
+          codigo_final="${codigo_final: -3}"
           if [ "$codigo_final" = "200" ]; then
             echo "RECUPERADO SOLO justo antes de actuar (HTTP $codigo_final). No se reinicia nada."
             echo "modo=ninguno" >> "$GITHUB_OUTPUT"; echo "resultado=recuperado_solo" >> "$GITHUB_OUTPUT"; exit 0
@@ -133,6 +150,7 @@ jobs:
             http=$(curl -sS -o /tmp/restart.json -w '%{http_code}' --max-time 60 -X POST \
               -H "Authorization: Bearer $EASYPANEL_TOKEN" -H "Content-Type: application/json" \
               "$EASYPANEL_URL/api/trpc/services.app.restartService" -d "$cuerpo" || echo 000)
+            http="${http: -3}"
             echo "EasyPanel respondió HTTP $http (intento $intento/2): $(head -c 300 /tmp/restart.json)"
             if [ "$http" = "200" ]; then break; fi
             [ "$intento" -eq 1 ] && sleep 10
@@ -149,6 +167,7 @@ jobs:
           for i in $(seq 1 15); do
             sleep 10
             codigo=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$N8N_HEALTH_URL" 2>/dev/null || echo 000)
+            codigo="${codigo: -3}"
             echo "reverificación $i/15: HTTP $codigo"
             if [ "$codigo" = "200" ]; then echo "resultado=resuelto" >> "$GITHUB_OUTPUT"; echo "segundos=$((i*10))" >> "$GITHUB_OUTPUT"; exit 0; fi
           done
@@ -181,6 +200,7 @@ jobs:
             http=$(curl -sS -o /tmp/log.json -w '%{http_code}' --max-time 15 -X POST \
               -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" -H "Content-Type: application/json" -H "Prefer: return=minimal" \
               "$SUPABASE_URL/rest/v1/vigilante_autofix_log" -d "$body" || echo 000)
+            http="${http: -3}"
             echo "Supabase autofix_log intento $intento/3: HTTP $http $(head -c 200 /tmp/log.json)"
             case "$http" in 2??) break ;; esac
             [ "$intento" -lt 3 ] && sleep 5
@@ -188,4 +208,5 @@ jobs:
           txt="$txt"$'\n'"Corrida: $RUN_URL"
           http=$(curl -sS -o /tmp/tg.json -w '%{http_code}' --max-time 15 -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
             --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "parse_mode=HTML" --data-urlencode "text=$txt" || echo 000)
+          http="${http: -3}"
           echo "Telegram: HTTP $http"
