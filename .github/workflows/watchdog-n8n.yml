@@ -228,13 +228,14 @@ jobs:
           T=MARCA
           # Regla de 2 strikes: la corrida anterior (si fue hace <25 min) ¿quedó inalcanzable y aún sin avisar?
           previa_inalcanzable() {
-            local fila pid creada jid log
-            fila=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watchdog-n8n.yml/runs?status=completed&per_page=5"               --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID)][0] | [.id,.created_at] | @tsv" 2>/dev/null) || return 1
+            local fila pid creada jid log err
+            fila=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watchdog-n8n.yml/runs?status=completed&per_page=5" --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID)][0] | [.id,.created_at] | @tsv" 2>/tmp/e1) || { echo "previa: no pude listar corridas: $(head -c 150 /tmp/e1)"; return 1; }
             pid=$(echo "$fila" | cut -f1); creada=$(echo "$fila" | cut -f2)
-            [ -n "$pid" ] && [ "$pid" != "null" ] || return 1
-            [ $(( $(date -u +%s) - $(date -u -d "$creada" +%s) )) -lt 1500 ] || return 1
-            jid=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$pid/jobs" --jq '.jobs[0].id' 2>/dev/null) || return 1
-            log=$(gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$jid/logs" 2>/dev/null) || return 1
+            [ -n "$pid" ] && [ "$pid" != "null" ] || { echo "previa: sin corrida anterior"; return 1; }
+            [ $(( $(date -u +%s) - $(date -u -d "$creada" +%s) )) -lt 1500 ] || { echo "previa: la corrida anterior es de hace más de 25 min"; return 1; }
+            jid=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$pid/jobs" --jq '.jobs[0].id' 2>/tmp/e2) || { echo "previa: no pude leer jobs: $(head -c 150 /tmp/e2)"; return 1; }
+            log=$(gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$jid/logs" 2>/tmp/e3) || { echo "previa: no pude leer el log: $(head -c 150 /tmp/e3)"; return 1; }
+            echo "previa: corrida $pid, log de ${#log} bytes"
             echo "$log" | grep -q "${T}=INALCANZABLE" && ! echo "$log" | grep -q "${T}=ALERTADO"
           }
           case "$RES" in
