@@ -35,6 +35,19 @@
 # patrón (health check, reconfirmación, reinicio, reverificación, log a
 # Supabase) -- no solo donde rompía la lógica, también donde solo ensuciaba
 # el log con "HTTP 000000".
+#
+# 2026-09-19: auditoria de 18 falsos positivos en 3 dias (ver REC-007 seccion 0.2 en
+# Asistente_Empresarial). Causa: el camino runner-de-GitHub -> VPS se corta ~6 min
+# (n8n, EasyPanel y Supabase dan timeout de CONEXION a la vez; n8n nunca se cayo).
+# Cambios de esta version:
+#   6. Si los 3 son inalcanzables a la vez (resultado restart_sin_conexion) el aviso
+#      ya NO es "n8n caido": solo avisa si la corrida ANTERIOR tambien quedo
+#      inalcanzable (dos strikes seguidos, ~10 min). Un solo strike = solo log.
+#   7. Paso de diagnostico solo-lectura al fallar: IP y ASN del runner, puertos
+#      80/22/443 y traceroute (destino enmascarado) para saber si es bloqueo de IP.
+#   8. El reinicio a EasyPanel falla rapido (--connect-timeout 10) en vez de esperar
+#      60 s x2: la corrida sin conexion baja de ~6 min a ~3.5 min.
+#   9. Nuevo forzar_estado=inalcanzable para probar el camino sin tocar nada.
 name: Watchdog n8n externo (REC-007)
 
 on:
@@ -43,7 +56,7 @@ on:
   workflow_dispatch:
     inputs:
       forzar_estado:
-        description: "Prueba: 'caido' simula que n8n no responde (no toca n8n). Vacío = check normal."
+        description: "Prueba: 'caido' simula n8n caido; 'inalcanzable' simula VPS inalcanzable desde GitHub (no toca nada). Vacío = check normal."
         required: false
         default: ""
 
@@ -52,7 +65,8 @@ concurrency:
   group: watchdog-n8n
   cancel-in-progress: false
 
-permissions: {}
+permissions:
+  actions: read   # solo para leer el log de la corrida anterior (regla de 2 strikes)
 
 jobs:
   vigilar:
@@ -72,6 +86,7 @@ jobs:
       COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
       FORZAR_ESTADO: ${{ github.event.inputs.forzar_estado }}
       RECETA_ID: REC-007
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Validar configuración
         run: |
@@ -89,6 +104,10 @@ jobs:
             echo "PRUEBA: estado forzado a 'caido' (el servicio NO fue tocado)"
             echo "estado=caido" >> "$GITHUB_OUTPUT"; echo "codigo=SIMULADO" >> "$GITHUB_OUTPUT"; exit 0
           fi
+          if [ "$FORZAR_ESTADO" = "inalcanzable" ]; then
+            echo "PRUEBA: estado forzado a 'inalcanzable' (nada fue tocado)"
+            echo "estado=caido" >> "$GITHUB_OUTPUT"; echo "codigo=000" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           codigo=000
           for i in 1 2 3 4 5; do
             codigo=$(curl -sS -o /tmp/salud.json -w '%{http_code}' --max-time 15 "$N8N_HEALTH_URL" 2>/dev/null || echo 000)
@@ -104,13 +123,28 @@ jobs:
           echo "CAIDO: el servicio no responde tras 5 intentos en ~2.5 min (último HTTP $codigo)"
           echo "estado=caido" >> "$GITHUB_OUTPUT"; echo "codigo=$codigo" >> "$GITHUB_OUTPUT"
 
+      - name: Diagnóstico de red (solo lectura, solo si falló)
+        if: steps.salud.outputs.estado == 'caido' && !github.event.inputs.forzar_estado
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          HOST=$(echo "$N8N_HEALTH_URL" | sed -E 's#https?://([^/:]+).*#\1#')
+          VPS=$(getent ahostsv4 "$HOST" | awk '{print $1; exit}')
+          MYIP=$(curl -s --max-time 8 https://api.ipify.org || echo "?")
+          ORG=$(curl -s --max-time 8 "https://ipinfo.io/$MYIP/org" || echo "?")
+          p() { timeout 5 bash -c "</dev/tcp/$VPS/$1" >/dev/null 2>&1 && echo abre || echo SIN-RESPUESTA; }
+          echo "DIAG runner_ip=$MYIP asn=[$ORG] puerto443=$(p 443) puerto80=$(p 80) puerto22=$(p 22) control_cloudflare=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 https://www.cloudflare.com || echo 000)"
+          sudo apt-get update -qq >/dev/null 2>&1; sudo apt-get install -y -qq traceroute >/dev/null 2>&1
+          sudo timeout 40 traceroute -T -p 443 -n -w 2 -m 18 "$VPS" 2>&1 | sed "s/$VPS/VPS/g; s/$HOST/HOST/g" | sed 's/^/DIAG-TRACE /' || true
+
       - name: Cooldown (¿ya se actuó en los últimos minutos?)
         id: cooldown
         if: steps.salud.outputs.estado == 'caido'
         run: |
           desde=$(date -u -d "-${COOLDOWN_MIN} minutes" +%Y-%m-%dT%H:%M:%SZ)
-          n=$(curl -sS --max-time 15 -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-            "$SUPABASE_URL/rest/v1/vigilante_autofix_log?receta_id=eq.$RECETA_ID&iniciado_en=gte.$desde&select=id" | jq 'length' 2>/dev/null || echo "error")
+          resp=$(curl -sf --max-time 15 -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"             "$SUPABASE_URL/rest/v1/vigilante_autofix_log?receta_id=eq.$RECETA_ID&iniciado_en=gte.$desde&select=id") || resp=""
+          n=$(echo "$resp" | jq 'length' 2>/dev/null || echo "error")
+          [ -z "$resp" ] && n="error"
           if [ "$n" = "error" ]; then
             echo "AVISO: no se pudo consultar el cooldown en Supabase. Por seguridad se actúa igual (n8n caído pesa más)."
             echo "actuar=si" >> "$GITHUB_OUTPUT"
@@ -128,6 +162,11 @@ jobs:
         run: |
           inicio=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           echo "inicio=$inicio" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORZAR_ESTADO" = "inalcanzable" ]; then
+            echo "PRUEBA: se simula que EasyPanel tampoco conecta (nada fue tocado)"
+            echo "modo=real" >> "$GITHUB_OUTPUT"; echo "http_restart=000" >> "$GITHUB_OUTPUT"; echo "resultado=restart_sin_conexion" >> "$GITHUB_OUTPUT"; exit 0
+          fi
 
           # Última oportunidad: el blip pudo resolverse solo mientras corría el
           # cooldown (2026-09-17: la caída real duró ~2-3 min, tiempo de sobra
@@ -147,7 +186,7 @@ jobs:
           cuerpo=$(jq -n --arg p "$EASYPANEL_PROJECT" --arg s "$EASYPANEL_SERVICE" '{json:{projectName:$p, serviceName:$s}}')
           http=000
           for intento in 1 2; do
-            http=$(curl -sS -o /tmp/restart.json -w '%{http_code}' --max-time 60 -X POST \
+            http=$(curl -sS -o /tmp/restart.json -w '%{http_code}' --connect-timeout 10 --max-time 60 -X POST \
               -H "Authorization: Bearer $EASYPANEL_TOKEN" -H "Content-Type: application/json" \
               "$EASYPANEL_URL/api/trpc/services.app.restartService" -d "$cuerpo" || echo 000)
             http="${http: -3}"
@@ -184,12 +223,31 @@ jobs:
           HTTP_RESTART: ${{ steps.accion.outputs.http_restart }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # Regla de 2 strikes: la corrida anterior (si fue hace <25 min) ¿quedó inalcanzable y aún sin avisar?
+          previa_inalcanzable() {
+            local fila pid creada jid log
+            fila=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watchdog-n8n.yml/runs?status=completed&per_page=5"               --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID)][0] | [.id,.created_at] | @tsv" 2>/dev/null) || return 1
+            pid=$(echo "$fila" | cut -f1); creada=$(echo "$fila" | cut -f2)
+            [ -n "$pid" ] && [ "$pid" != "null" ] || return 1
+            [ $(( $(date -u +%s) - $(date -u -d "$creada" +%s) )) -lt 1500 ] || return 1
+            jid=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$pid/jobs" --jq '.jobs[0].id' 2>/dev/null) || return 1
+            log=$(gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$jid/logs" 2>/dev/null) || return 1
+            echo "$log" | grep -q "MARCA=INALCANZABLE" && ! echo "$log" | grep -q "MARCA=ALERTADO"
+          }
           case "$RES" in
             recuperado_solo)      estado="resuelto"; txt="🟡 <b>[Watchdog n8n externo]</b> n8n no respondió varias veces seguidas (HTTP $CODIGO), pero volvió a responder solo justo antes de que se intentara reiniciar. No se tocó nada." ;;
             sombra)                estado="sombra";   txt="🌓 <b>[Watchdog n8n externo]</b> MODO SOMBRA: n8n no respondió 5 veces seguidas en ~2.5 min (HTTP $CODIGO). En modo real aquí lo habría reiniciado vía EasyPanel. No se hizo nada." ;;
             resuelto)               estado="resuelto"; txt="✅ <b>[Watchdog n8n externo]</b> n8n no respondía (HTTP $CODIGO). Lo reinicié vía EasyPanel y volvió a responder en $SEGUNDOS s." ;;
             sigue_caido)            estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no respondía. Lo reinicié vía EasyPanel pero SIGUE sin responder después de 150 s. Revisar a mano (EasyPanel → servicio de n8n → logs)." ;;
-            restart_sin_conexion)   estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y NO pude ni conectarme a EasyPanel para pedir el reinicio (timeout, no un rechazo). Probable problema de red hacia el VPS, no necesariamente n8n caído por dentro. Revisar a mano." ;;
+            restart_sin_conexion)
+              echo "MARCA=INALCANZABLE"
+              if previa_inalcanzable; then
+                echo "MARCA=ALERTADO"
+                estado="fallido"; txt="🟠 <b>[Watchdog n8n externo]</b> No alcanzo el VPS desde GitHub en 2 corridas seguidas (~10 min): n8n, EasyPanel y Supabase no contestan. Casi seguro es la red hacia el VPS y n8n sigue vivo por dentro (si siguen llegando avisos del Vigilante, es eso). Si dura más, revisar el VPS en Hostinger."
+              else
+                echo "Primera vez que no alcanzo el VPS: sin aviso (se avisa si la siguiente corrida también falla). Solo queda en el log."
+                exit 0
+              fi ;;
             restart_rechazado)      estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y EasyPanel RECHAZÓ la orden de reinicio (HTTP $HTTP_RESTART). Revisar token/credenciales de EasyPanel. Revisar a mano." ;;
             *)                      estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y el reinicio terminó en estado desconocido ('$RES'). Revisar a mano." ;;
           esac
