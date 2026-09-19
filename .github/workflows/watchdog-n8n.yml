@@ -223,6 +223,9 @@ jobs:
           HTTP_RESTART: ${{ steps.accion.outputs.http_restart }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # OJO: GitHub imprime el codigo fuente del paso en el log, asi que el texto de la marca
+          # NO puede aparecer literal aqui (se armaria un falso positivo en cada corrida).
+          T=MARCA
           # Regla de 2 strikes: la corrida anterior (si fue hace <25 min) ¿quedó inalcanzable y aún sin avisar?
           previa_inalcanzable() {
             local fila pid creada jid log
@@ -232,7 +235,7 @@ jobs:
             [ $(( $(date -u +%s) - $(date -u -d "$creada" +%s) )) -lt 1500 ] || return 1
             jid=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$pid/jobs" --jq '.jobs[0].id' 2>/dev/null) || return 1
             log=$(gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$jid/logs" 2>/dev/null) || return 1
-            echo "$log" | grep -q "MARCA=INALCANZABLE" && ! echo "$log" | grep -q "MARCA=ALERTADO"
+            echo "$log" | grep -q "${T}=INALCANZABLE" && ! echo "$log" | grep -q "${T}=ALERTADO"
           }
           case "$RES" in
             recuperado_solo)      estado="resuelto"; txt="🟡 <b>[Watchdog n8n externo]</b> n8n no respondió varias veces seguidas (HTTP $CODIGO), pero volvió a responder solo justo antes de que se intentara reiniciar. No se tocó nada." ;;
@@ -240,9 +243,9 @@ jobs:
             resuelto)               estado="resuelto"; txt="✅ <b>[Watchdog n8n externo]</b> n8n no respondía (HTTP $CODIGO). Lo reinicié vía EasyPanel y volvió a responder en $SEGUNDOS s." ;;
             sigue_caido)            estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no respondía. Lo reinicié vía EasyPanel pero SIGUE sin responder después de 150 s. Revisar a mano (EasyPanel → servicio de n8n → logs)." ;;
             restart_sin_conexion)
-              echo "MARCA=INALCANZABLE"
+              echo "${T}=INALCANZABLE"
               if previa_inalcanzable; then
-                echo "MARCA=ALERTADO"
+                echo "${T}=ALERTADO"
                 estado="fallido"; txt="🟠 <b>[Watchdog n8n externo]</b> No alcanzo el VPS desde GitHub en 2 corridas seguidas (~10 min): n8n, EasyPanel y Supabase no contestan. Casi seguro es la red hacia el VPS y n8n sigue vivo por dentro (si siguen llegando avisos del Vigilante, es eso). Si dura más, revisar el VPS en Hostinger."
               else
                 echo "Primera vez que no alcanzo el VPS: sin aviso (se avisa si la siguiente corrida también falla). Solo queda en el log."
