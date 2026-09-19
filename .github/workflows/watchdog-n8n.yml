@@ -234,9 +234,9 @@ jobs:
             [ -n "$pid" ] && [ "$pid" != "null" ] || { echo "previa: sin corrida anterior"; return 1; }
             [ $(( $(date -u +%s) - $(date -u -d "$creada" +%s) )) -lt 1500 ] || { echo "previa: la corrida anterior es de hace más de 25 min"; return 1; }
             jid=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$pid/jobs" --jq '.jobs[0].id' 2>/tmp/e2) || { echo "previa: no pude leer jobs: $(head -c 150 /tmp/e2)"; return 1; }
-            log=$(gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$jid/logs" 2>/tmp/e3) || { echo "previa: no pude leer el log: $(head -c 150 /tmp/e3)"; return 1; }
+            log=$(curl -sfL --max-time 20 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/jobs/$jid/logs" 2>/tmp/e3) || { echo "previa: no pude leer el log: $(head -c 150 /tmp/e3)"; return 1; }
             echo "previa: corrida $pid, log de ${#log} bytes"
-            echo "$log" | grep -q "${T}=INALCANZABLE" && ! echo "$log" | grep -q "${T}=ALERTADO"
+            echo "$log" | grep -aq "${T}=INALCANZABLE" && ! echo "$log" | grep -aq "${T}=ALERTADO"
           }
           case "$RES" in
             recuperado_solo)      estado="resuelto"; txt="🟡 <b>[Watchdog n8n externo]</b> n8n no respondió varias veces seguidas (HTTP $CODIGO), pero volvió a responder solo justo antes de que se intentara reiniciar. No se tocó nada." ;;
