@@ -194,7 +194,9 @@ jobs:
           K_AV="PAUSADO_AVISADO${S}="; K_PE="CONSTANCIA_PENDIENTE${S}="; K_RE="CONSTANCIA_REPUESTA${S}="
           echo "aviso_previo=no" >> "$GITHUB_OUTPUT"
           ventana=$(( COOLDOWN_MIN * 60 )); ahora=$(date -u +%s)
-          filas=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watchdog-n8n.yml/runs?status=completed&per_page=15" --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID) | [.id,.created_at] | @tsv" 2>/tmp/m0) || { echo "memoria-bitácora: no pude listar corridas: $(head -c 150 /tmp/m0)"; exit 0; }
+          # Se filtra por fecha (created>=ahora-ventana) y se ordena aquí: el orden de la lista con status=completed no es de fiar.
+          desde=$(date -u -d "-${COOLDOWN_MIN} minutes" +%Y-%m-%dT%H:%M:%SZ)
+          filas=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watchdog-n8n.yml/runs?status=completed&created=%3E%3D$desde&per_page=30" --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID)] | sort_by(.created_at) | reverse | .[] | [.id,.created_at] | @tsv" 2>/tmp/m0) || { echo "memoria-bitácora: no pude listar corridas: $(head -c 150 /tmp/m0)"; exit 0; }
           ult_aviso=0; : > /tmp/pend.txt; : > /tmp/rep.txt; leidas=0
           while IFS=$'\t' read -r rid creada; do
             [ -n "$rid" ] || continue
