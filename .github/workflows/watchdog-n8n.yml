@@ -156,7 +156,9 @@ jobs:
           # Último valor leído: la primera corrida completada (hacia atrás) cuyo log tenga la marca del MISMO modo.
           vistas=0; pagina=1; hallado=""; run_origen=""; inicio=$SECONDS; por_pagina=100
           if [ "$MAX_CORRIDAS_MEMORIA" -lt "$por_pagina" ]; then por_pagina="$MAX_CORRIDAS_MEMORIA"; fi
-          lim0=$(curl -s --max-time 10 -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/rate_limit | jq -r '.resources.core.remaining' 2>/dev/null || echo "?")
+          # Cuota de la API que ve ESTE token (cabeceras x-ratelimit-*; la consulta cuenta 1 llamada)
+          cuota() { curl -sI --max-time 10 -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$GITHUB_REPOSITORY" | tr -d '\r' | grep -ai '^x-ratelimit-\(limit\|remaining\|resource\):' | sed 's/^x-ratelimit-//I' | tr '\n' ' ' || true; }
+          lim0=$(cuota)
           while [ -z "$hallado" ] && [ "$vistas" -lt "$MAX_CORRIDAS_MEMORIA" ] && [ $((SECONDS - inicio)) -lt 170 ]; do
             ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watchdog-n8n.yml/runs?status=completed&per_page=$por_pagina&page=$pagina" --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID) | .id" 2>/tmp/e0) || { echo "memoria: no pude listar corridas: $(head -c 150 /tmp/e0)"; break; }
             if [ -z "$ids" ]; then echo "memoria: no hay más corridas"; break; fi
@@ -172,8 +174,8 @@ jobs:
             done
             pagina=$((pagina+1))
           done
-          lim1=$(curl -s --max-time 10 -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/rate_limit | jq -r '.resources.core.remaining' 2>/dev/null || echo "?")
-          echo "MEMORIA: corridas leídas=$vistas (tope $MAX_CORRIDAS_MEMORIA) en $((SECONDS - inicio)) s; cuota de la API restante $lim0 -> $lim1"
+          lim1=$(cuota)
+          echo "MEMORIA: corridas leídas=$vistas (tope $MAX_CORRIDAS_MEMORIA) en $((SECONDS - inicio)) s; cuota de la API antes [$lim0] después [$lim1]"
           if [ "$hallado" = "true" ] || [ "$hallado" = "false" ]; then
             echo "Interruptor PARA TODO: origen=recordado pausa=$hallado (de la corrida $run_origen)"
             echo "pausa=$hallado" >> "$GITHUB_OUTPUT"; echo "origen=recordado" >> "$GITHUB_OUTPUT"
