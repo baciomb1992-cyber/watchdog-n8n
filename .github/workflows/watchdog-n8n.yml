@@ -56,7 +56,20 @@ on:
   workflow_dispatch:
     inputs:
       forzar_estado:
-        description: "Prueba: 'caido' simula n8n caido; 'inalcanzable' simula VPS inalcanzable desde GitHub (no toca nada). Vacío = check normal."
+        description: "Prueba: 'caido' simula n8n caido; 'inalcanzable' simula VPS inalcanzable desde GitHub (no toca nada); 'caido_persistente' (solo con modo_prueba=true) fuerza también la reconfirmación a caído. Vacío = check normal."
+        required: false
+        default: ""
+      modo_prueba:
+        description: "Solo prueba (spec 001): true = NUNCA llama a EasyPanel, usa las tablas de abajo (deben ser de prueba), imprime la marca de prueba y antepone [PRUEBA] a todo Telegram. Normal = false."
+        type: boolean
+        required: false
+        default: false
+      tabla_config:
+        description: "Solo prueba: tabla del interruptor PARA TODO (vacío = vigilante_config). Con modo_prueba=true debe ser de prueba."
+        required: false
+        default: ""
+      tabla_log:
+        description: "Solo prueba: bitácora de intentos (vacío = vigilante_autofix_log). Con modo_prueba=true debe ser de prueba."
         required: false
         default: ""
 
@@ -85,6 +98,12 @@ jobs:
       MODO_SOMBRA: ${{ vars.MODO_SOMBRA }}
       COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
       FORZAR_ESTADO: ${{ github.event.inputs.forzar_estado }}
+      # Spec 001 (PARA TODO): solo prueba. Una corrida normal (cron) tiene MODO_PRUEBA=false y las tablas reales.
+      MODO_PRUEBA: ${{ github.event.inputs.modo_prueba == 'true' }}
+      TABLA_CONFIG: ${{ github.event.inputs.tabla_config || 'vigilante_config' }}
+      TABLA_LOG: ${{ github.event.inputs.tabla_log || 'vigilante_autofix_log' }}
+      # Tope de corridas hacia atrás al buscar el último valor leído del interruptor (medido en T8: ver README)
+      MAX_CORRIDAS_MEMORIA: "100"
       RECETA_ID: REC-007
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -95,13 +114,78 @@ jobs:
             if [ -z "${!v}" ]; then faltan="$faltan $v"; fi
           done
           if [ -n "$faltan" ]; then echo "::error::Faltan secrets/variables:$faltan"; exit 1; fi
-          echo "Config OK | modo_sombra=$MODO_SOMBRA | cooldown=${COOLDOWN_MIN} min"
+          # Nombres de tabla: solo minúsculas, dígitos y guion bajo (van directo a la URL de PostgREST)
+          for v in TABLA_CONFIG TABLA_LOG; do
+            if ! echo "${!v}" | grep -Eq '^[a-z0-9_]+$'; then echo "::error::$v tiene caracteres no permitidos"; exit 1; fi
+          done
+          if [ "$MODO_PRUEBA" = "true" ]; then
+            # Una corrida de prueba nunca toca tablas reales: ambas tablas deben ser de prueba.
+            for v in TABLA_CONFIG TABLA_LOG; do
+              case "${!v}" in
+                *_prueba*) ;;
+                *) echo "::error::modo_prueba=true no puede usar tablas reales ($v=${!v}): una corrida de prueba solo usa tablas de prueba"; exit 1 ;;
+              esac
+            done
+          else
+            if [ "$FORZAR_ESTADO" = "caido_persistente" ]; then echo "::error::forzar_estado=caido_persistente solo existe con modo_prueba=true"; exit 1; fi
+            if [ "$TABLA_CONFIG" != "vigilante_config" ] || [ "$TABLA_LOG" != "vigilante_autofix_log" ]; then echo "::error::tabla_config/tabla_log solo se pueden cambiar con modo_prueba=true"; exit 1; fi
+          fi
+          echo "Config OK | modo_sombra=$MODO_SOMBRA | cooldown=${COOLDOWN_MIN} min | modo_prueba=$MODO_PRUEBA | tabla_config=$TABLA_CONFIG | tabla_log=$TABLA_LOG"
+
+      - name: Leer interruptor PARA TODO
+        id: pausa
+        continue-on-error: true
+        timeout-minutes: 4
+        run: |
+          # OJO: GitHub imprime el fuente del paso en el log: las marcas se arman con variables (nada literal aquí).
+          # La corrida real y la de prueba usan marcas distintas: una prueba nunca contamina el valor recordado de producción.
+          T=MARCA; P=PAUSA
+          if [ "$MODO_PRUEBA" = "true" ]; then M="${T}${P}_PRUEBA="; else M="${T}${P}="; fi
+          # Por defecto: nunca leído (si el paso muere a medias, el reinicio falla cerrado: solo actúa con pausa=false)
+          echo "pausa=desconocida" >> "$GITHUB_OUTPUT"; echo "origen=nunca" >> "$GITHUB_OUTPUT"
+          resp=$(curl -sf --max-time 15 -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            "$SUPABASE_URL/rest/v1/$TABLA_CONFIG?select=autofix_pausado&limit=1") || resp=""
+          val=$(echo "$resp" | jq -r 'if (type=="array" and length>0 and (.[0].autofix_pausado|type=="boolean")) then (.[0].autofix_pausado|tostring) else "ilegible" end' 2>/dev/null || true)
+          if [ "$val" = "true" ] || [ "$val" = "false" ]; then
+            echo "${M}${val}"
+            echo "Interruptor PARA TODO: origen=leido pausa=$val (tabla $TABLA_CONFIG)"
+            echo "pausa=$val" >> "$GITHUB_OUTPUT"; echo "origen=leido" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "AVISO: no pude leer el interruptor PARA TODO en $TABLA_CONFIG (Supabase no responde o la fila no existe). Busco el último valor leído en corridas previas (tope $MAX_CORRIDAS_MEMORIA)."
+          # Último valor leído: la primera corrida completada (hacia atrás) cuyo log tenga la marca del MISMO modo.
+          vistas=0; pagina=1; hallado=""; run_origen=""; inicio=$SECONDS; por_pagina=100
+          if [ "$MAX_CORRIDAS_MEMORIA" -lt "$por_pagina" ]; then por_pagina="$MAX_CORRIDAS_MEMORIA"; fi
+          lim0=$(curl -s --max-time 10 -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/rate_limit | jq -r '.resources.core.remaining' 2>/dev/null || echo "?")
+          while [ -z "$hallado" ] && [ "$vistas" -lt "$MAX_CORRIDAS_MEMORIA" ] && [ $((SECONDS - inicio)) -lt 170 ]; do
+            ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watchdog-n8n.yml/runs?status=completed&per_page=$por_pagina&page=$pagina" --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID) | .id" 2>/tmp/e0) || { echo "memoria: no pude listar corridas: $(head -c 150 /tmp/e0)"; break; }
+            if [ -z "$ids" ]; then echo "memoria: no hay más corridas"; break; fi
+            for rid in $ids; do
+              if [ "$vistas" -ge "$MAX_CORRIDAS_MEMORIA" ] || [ $((SECONDS - inicio)) -ge 170 ]; then break; fi
+              vistas=$((vistas+1))
+              jid=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$rid/jobs" --jq '.jobs[0].id' 2>/dev/null) || continue
+              if [ -z "$jid" ] || [ "$jid" = "null" ]; then continue; fi
+              lg=$(curl -sfL --max-time 20 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/jobs/$jid/logs" 2>/dev/null) || continue
+              m=$(echo "$lg" | grep -aoE "${M}(true|false)" || true)
+              m="${m%%$'\n'*}"
+              if [ -n "$m" ]; then hallado="${m#"$M"}"; run_origen="$rid"; break; fi
+            done
+            pagina=$((pagina+1))
+          done
+          lim1=$(curl -s --max-time 10 -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/rate_limit | jq -r '.resources.core.remaining' 2>/dev/null || echo "?")
+          echo "MEMORIA: corridas leídas=$vistas (tope $MAX_CORRIDAS_MEMORIA) en $((SECONDS - inicio)) s; cuota de la API restante $lim0 -> $lim1"
+          if [ "$hallado" = "true" ] || [ "$hallado" = "false" ]; then
+            echo "Interruptor PARA TODO: origen=recordado pausa=$hallado (de la corrida $run_origen)"
+            echo "pausa=$hallado" >> "$GITHUB_OUTPUT"; echo "origen=recordado" >> "$GITHUB_OUTPUT"
+          else
+            echo "Interruptor PARA TODO: origen=nunca pausa=desconocida (ninguna corrida con valor leído dentro del tope)"
+          fi
 
       - name: Health check de n8n (5 intentos, 20 s entre cada uno, ~2.5 min)
         id: salud
         run: |
-          if [ "$FORZAR_ESTADO" = "caido" ]; then
-            echo "PRUEBA: estado forzado a 'caido' (el servicio NO fue tocado)"
+          if [ "$FORZAR_ESTADO" = "caido" ] || [ "$FORZAR_ESTADO" = "caido_persistente" ]; then
+            echo "PRUEBA: estado forzado a '$FORZAR_ESTADO' (el servicio NO fue tocado)"
             echo "estado=caido" >> "$GITHUB_OUTPUT"; echo "codigo=SIMULADO" >> "$GITHUB_OUTPUT"; exit 0
           fi
           if [ "$FORZAR_ESTADO" = "inalcanzable" ]; then
@@ -142,7 +226,7 @@ jobs:
         if: steps.salud.outputs.estado == 'caido'
         run: |
           desde=$(date -u -d "-${COOLDOWN_MIN} minutes" +%Y-%m-%dT%H:%M:%SZ)
-          resp=$(curl -sf --max-time 15 -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"             "$SUPABASE_URL/rest/v1/vigilante_autofix_log?receta_id=eq.$RECETA_ID&iniciado_en=gte.$desde&select=id") || resp=""
+          resp=$(curl -sf --max-time 15 -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"             "$SUPABASE_URL/rest/v1/$TABLA_LOG?receta_id=eq.$RECETA_ID&iniciado_en=gte.$desde&select=id") || resp=""
           n=$(echo "$resp" | jq 'length' 2>/dev/null || echo "error")
           [ -z "$resp" ] && n="error"
           if [ "$n" = "error" ]; then
@@ -159,6 +243,9 @@ jobs:
       - name: Reiniciar n8n vía EasyPanel (o solo simular, en modo sombra)
         id: accion
         if: steps.salud.outputs.estado == 'caido' && steps.cooldown.outputs.actuar == 'si'
+        env:
+          PAUSA_VAL: ${{ steps.pausa.outputs.pausa }}
+          PAUSA_ORIGEN: ${{ steps.pausa.outputs.origen }}
         run: |
           inicio=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           echo "inicio=$inicio" >> "$GITHUB_OUTPUT"
@@ -171,11 +258,32 @@ jobs:
           # Última oportunidad: el blip pudo resolverse solo mientras corría el
           # cooldown (2026-09-17: la caída real duró ~2-3 min, tiempo de sobra
           # para colarse en esta ventana). Reinicia solo si SIGUE caído.
-          codigo_final=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$N8N_HEALTH_URL" 2>/dev/null || echo 000)
-          codigo_final="${codigo_final: -3}"
+          if [ "$FORZAR_ESTADO" = "caido_persistente" ]; then
+            codigo_final=000   # solo prueba: la reconfirmación también da «caído»
+          else
+            codigo_final=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$N8N_HEALTH_URL" 2>/dev/null || echo 000)
+            codigo_final="${codigo_final: -3}"
+          fi
           if [ "$codigo_final" = "200" ]; then
             echo "RECUPERADO SOLO justo antes de actuar (HTTP $codigo_final). No se reinicia nada."
             echo "modo=ninguno" >> "$GITHUB_OUTPUT"; echo "resultado=recuperado_solo" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # PARA TODO (spec 001): se decide ANTES de cualquier acción. Solo se actúa con pausa=false (leída o recordada);
+          # pausa=true o ilegible-sin-valor-recordado fallan cerrado (no se reinicia y se avisa).
+          if [ "$PAUSA_VAL" = "true" ]; then
+            echo "PAUSADO: PARA TODO está prendido (origen=$PAUSA_ORIGEN). No se reinicia nada."
+            echo "modo=ninguno" >> "$GITHUB_OUTPUT"; echo "resultado=pausado" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$PAUSA_VAL" != "false" ]; then
+            echo "PAUSADO: no pude leer el interruptor PARA TODO y no hay valor recordado. Por seguridad no se reinicia nada."
+            echo "modo=ninguno" >> "$GITHUB_OUTPUT"; echo "resultado=pausado_ilegible" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # Modo prueba: NUNCA se llama a EasyPanel (el bloque de reinicio real de abajo no se alcanza).
+          if [ "$MODO_PRUEBA" = "true" ]; then
+            echo "HABRIA REINICIADO (modo prueba)"
+            echo "modo=sombra" >> "$GITHUB_OUTPUT"; echo "resultado=sombra_prueba" >> "$GITHUB_OUTPUT"; exit 0
           fi
 
           if [ "$MODO_SOMBRA" = "true" ]; then
@@ -221,11 +329,15 @@ jobs:
           SEGUNDOS: ${{ steps.accion.outputs.segundos }}
           CODIGO: ${{ steps.salud.outputs.codigo }}
           HTTP_RESTART: ${{ steps.accion.outputs.http_restart }}
+          PAUSA_VAL: ${{ steps.pausa.outputs.pausa }}
+          PAUSA_ORIGEN: ${{ steps.pausa.outputs.origen }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # OJO: GitHub imprime el codigo fuente del paso en el log, asi que el texto de la marca
           # NO puede aparecer literal aqui (se armaria un falso positivo en cada corrida).
           T=MARCA
+          # Una corrida de prueba usa otras marcas de 2 strikes: nunca cuenta como «corrida previa inalcanzable» de producción.
+          if [ "$MODO_PRUEBA" = "true" ]; then T=MARCAPRUEBA; fi
           # Regla de 2 strikes: la corrida anterior (si fue hace <25 min) ¿quedó inalcanzable y aún sin avisar?
           previa_inalcanzable() {
             local fila pid creada jid log err
@@ -238,7 +350,11 @@ jobs:
             echo "previa: corrida $pid, log de ${#log} bytes"
             echo "$log" | grep -aq "${T}=INALCANZABLE" && ! echo "$log" | grep -aq "${T}=ALERTADO"
           }
+          motivo=""
           case "$RES" in
+            pausado)               estado="pausado";  motivo="PARA TODO"; txt="⏸️ <b>[Watchdog n8n externo · PAUSADO]</b> n8n no respondió 5 veces seguidas (HTTP $CODIGO) pero NO lo reinicio: PARA TODO está prendido. Hora $INICIO. Acción: ninguna. Al quitar la pausa, reinicio en la siguiente corrida si sigue caído." ;;
+            pausado_ilegible)      estado="pausado";  motivo="interruptor ilegible"; txt="⏸️ <b>[Watchdog n8n externo · PAUSADO]</b> n8n no respondió 5 veces seguidas (HTTP $CODIGO) pero NO lo reinicio: no pude leer el interruptor PARA TODO (Supabase no responde) y no tengo un valor recordado; por seguridad no reinicio. Hora $INICIO. Acción: ninguna." ;;
+            sombra_prueba)         estado="sombra";   txt="🧪 <b>[Watchdog n8n externo]</b> PRUEBA: n8n simulado caído (HTTP $CODIGO); en modo real lo habría reiniciado vía EasyPanel. No se hizo nada." ;;
             recuperado_solo)      estado="resuelto"; txt="🟡 <b>[Watchdog n8n externo]</b> n8n no respondió varias veces seguidas (HTTP $CODIGO), pero volvió a responder solo justo antes de que se intentara reiniciar. No se tocó nada." ;;
             sombra)                estado="sombra";   txt="🌓 <b>[Watchdog n8n externo]</b> MODO SOMBRA: n8n no respondió 5 veces seguidas en ~2.5 min (HTTP $CODIGO). En modo real aquí lo habría reiniciado vía EasyPanel. No se hizo nada." ;;
             resuelto)               estado="resuelto"; txt="✅ <b>[Watchdog n8n externo]</b> n8n no respondía (HTTP $CODIGO). Lo reinicié vía EasyPanel y volvió a responder en $SEGUNDOS s." ;;
@@ -255,19 +371,27 @@ jobs:
             restart_rechazado)      estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y EasyPanel RECHAZÓ la orden de reinicio (HTTP $HTTP_RESTART). Revisar token/credenciales de EasyPanel. Revisar a mano." ;;
             *)                      estado="fallido";  txt="🔴 <b>[Watchdog n8n externo]</b> n8n no responde y el reinicio terminó en estado desconocido ('$RES'). Revisar a mano." ;;
           esac
-          body=$(jq -n --arg r "$RECETA_ID" --arg m "$MODO" --arg e "$estado" --arg ini "$INICIO" --arg url "$RUN_URL" --arg cod "$CODIGO" --arg hr "$HTTP_RESTART" \
-            '{receta_id:$r, intento:1, modo:$m, estado:$e, iniciado_en:$ini, finalizado_en:(now|todate), resultado:{origen:"github_actions", run:$url, http_salud:$cod, http_restart:$hr}, verificacion:{resultado:$e}}')
+          # Si el interruptor no se pudo leer y se usó el valor recordado, el aviso lo dice (spec 001)
+          if [ "$PAUSA_ORIGEN" = "recordado" ] && [ "$RES" != "pausado" ]; then
+            txt="$txt"$'\n'"Interruptor PARA TODO: Supabase no respondía; usé el valor recordado de la última lectura (pausa=$PAUSA_VAL)."
+          fi
+          # Todo Telegram de una corrida de prueba lleva el prefijo [PRUEBA] (se antepone al final, para cualquier resultado)
+          if [ "$MODO_PRUEBA" = "true" ]; then txt="[PRUEBA] $txt"; fi
+          echo "Resultado=$RES motivo=$motivo pausa_origen=$PAUSA_ORIGEN modo_prueba=$MODO_PRUEBA"
+          body=$(jq -n --arg r "$RECETA_ID" --arg m "$MODO" --arg e "$estado" --arg ini "$INICIO" --arg url "$RUN_URL" --arg cod "$CODIGO" --arg hr "$HTTP_RESTART" --arg mot "$motivo" --arg po "$PAUSA_ORIGEN" --arg mp "$MODO_PRUEBA" \
+            '{receta_id:$r, intento:1, modo:$m, estado:$e, iniciado_en:$ini, finalizado_en:(now|todate), resultado:{origen:"github_actions", run:$url, http_salud:$cod, http_restart:$hr, motivo:$mot, pausa_origen:$po, modo_prueba:($mp=="true")}, verificacion:{resultado:$e}}')
           http=000
           for intento in 1 2 3; do
             http=$(curl -sS -o /tmp/log.json -w '%{http_code}' --max-time 15 -X POST \
               -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" -H "Content-Type: application/json" -H "Prefer: return=minimal" \
-              "$SUPABASE_URL/rest/v1/vigilante_autofix_log" -d "$body" || echo 000)
+              "$SUPABASE_URL/rest/v1/$TABLA_LOG" -d "$body" || echo 000)
             http="${http: -3}"
             echo "Supabase autofix_log intento $intento/3: HTTP $http $(head -c 200 /tmp/log.json)"
             case "$http" in 2??) break ;; esac
             [ "$intento" -lt 3 ] && sleep 5
           done
           txt="$txt"$'\n'"Corrida: $RUN_URL"
+          if [ "$MODO_PRUEBA" = "true" ]; then echo "TELEGRAM_TEXTO: $txt"; fi
           http=$(curl -sS -o /tmp/tg.json -w '%{http_code}' --max-time 15 -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
             --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "parse_mode=HTML" --data-urlencode "text=$txt" || echo 000)
           http="${http: -3}"
