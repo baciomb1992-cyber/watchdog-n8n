@@ -103,7 +103,7 @@ jobs:
       TABLA_CONFIG: ${{ github.event.inputs.tabla_config || 'vigilante_config' }}
       TABLA_LOG: ${{ github.event.inputs.tabla_log || 'vigilante_autofix_log' }}
       # Tope de corridas hacia atrás al buscar el último valor leído del interruptor (medido en T8: ver README)
-      MAX_CORRIDAS_MEMORIA: "100"
+      MAX_CORRIDAS_MEMORIA: "60"
       RECETA_ID: REC-007
       GH_TOKEN: ${{ github.token }}
     steps:
